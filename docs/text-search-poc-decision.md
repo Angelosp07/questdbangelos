@@ -1,6 +1,6 @@
 # Text-search PoC: pre-BM25 decision record
 
-Status: scan skeleton implemented and measured; tokenization, scoring, indexing, and RRF are not implemented.
+Status: scan skeleton, no-op append-only writer seam, and fixed tokenizer contract implemented. Persistent postings, scoring, and RRF are not implemented.
 
 ## Recommendation
 
@@ -17,6 +17,15 @@ WHERE ts IN '2026-08-25'
 
 Do not add BM25 semantics to this boolean function. If the later design gate selects BM25, add a separate scoring or top-k surface so this simple predicate does not silently change meaning.
 
+The PoC also has a scan-backed top-k-shaped surface:
+
+```sql
+SELECT *
+FROM text_search('logs', 'message', 'timeout', '2026-08-24', '2026-08-26', 10);
+```
+
+It returns `ts`, `value`, and a placeholder `score = 1.0`, applies the half-open timestamp range `[from, to)`, and limits rows in natural timestamp order. Its plan is labelled `text_search scan fallback`; it does not rank or read an index.
+
 ## Smallest end-to-end path
 
 The scalar-function route is smaller than new grammar or a table function:
@@ -31,9 +40,11 @@ Current files:
 
 - `core/src/main/java/io/questdb/griffin/engine/functions/text/TextMatchVarcharFunctionFactory.java`: signature, validation, constant/bind handling, scan predicate, and plan rendering.
 - `core/src/test/java/io/questdb/test/griffin/engine/functions/text/TextMatchVarcharFunctionFactoryTest.java`: literal behavior, case sensitivity, null/empty values, Unicode, bind variables, cursor reopen, rejection of row-varying queries, and interval-plan coverage.
+- `core/src/main/java/io/questdb/griffin/engine/functions/text/TextSearchFunctionFactory.java`: table-function validation, safe SQL construction, scan-backed cursor factory, timestamp range, limit, and placeholder score.
+- `core/src/test/java/io/questdb/test/griffin/engine/functions/text/TextSearchFunctionFactoryTest.java`: rows, range boundaries, limit, validation, quoting, cursor reopen, and fallback plan coverage.
 - `benchmarks/src/main/java/org/questdb/TextSearchScanBenchmark.java`: deterministic corpus, semantic equivalence checks, append/storage measurements, and the JMH scan matrix.
 
-There is intentionally no parser, `SqlCodeGenerator`, table metadata, `TableWriter`, index, or dedicated `RecordCursorFactory` change in this version.
+There is intentionally no parser, `SqlCodeGenerator`, table metadata, `TableWriter`, or persistent index change in this version. The table function wraps the ordinary compiled scan cursor rather than adding an index-selected planner path.
 
 ## Existing patterns worth copying
 
@@ -52,6 +63,39 @@ Relevant files:
 - `core/src/main/java/io/questdb/griffin/engine/functions/rnd/LongSequenceFunctionFactory.java`
 - `core/src/main/java/io/questdb/griffin/engine/functions/CursorFunction.java`
 - `core/src/test/java/io/questdb/test/griffin/engine/functions/rnd/LongSequenceTest.java`
+
+## Append-only write seam and tokenizer
+
+The first write path is deliberately offline and has no index output yet:
+
+1. `TextColumnIndexer` reads a committed `[loRow, hiRow)` range from native VARCHAR aux/data memory using `VarcharTypeDriver`.
+2. It converts physical offsets using `columnTop`, while preserving partition-local row IDs.
+3. It calls `TextIndexWriter.add(rowId, value)` once per stored row, including null values.
+4. `NoOpTextIndexWriter` retains no values and writes no files; it only validates strictly increasing row IDs and exposes a commit watermark for tests.
+
+This is the minimal replacement point for the later partition-local file writer. It is intentionally not registered in `TableWriter`: an explicit offline build can open each committed native partition and use this range feeder without implying WAL, O3, deduplication, or metadata support.
+
+The tokenizer contract is also fixed:
+
+- tokens are non-empty runs of ASCII letters or digits (`[A-Za-z0-9]+`);
+- ASCII letters are lowercased;
+- punctuation, underscore, and every non-ASCII UTF-8 byte are delimiters;
+- repeated tokens are preserved for later term-frequency calculation;
+- null and empty documents emit no tokens;
+- emitted UTF-8 is a reused flyweight and cannot be retained by the consumer.
+
+Evidence files:
+
+- `core/src/main/java/io/questdb/cairo/TextColumnIndexer.java`
+- `core/src/main/java/io/questdb/cairo/idx/TextIndexWriter.java`
+- `core/src/main/java/io/questdb/cairo/idx/NoOpTextIndexWriter.java`
+- `core/src/main/java/io/questdb/cairo/idx/AsciiTextTokenizer.java`
+- `core/src/test/java/io/questdb/test/cairo/TextColumnIndexerTest.java`
+- `core/src/test/java/io/questdb/test/cairo/AsciiTextTokenizerTest.java`
+
+The five focused writer/tokenizer tests pass. They cover inline and split VARCHAR storage, nulls, `columnTop` row-ID mapping, append-order rejection, null/empty input, normalization, delimiter behavior, and repeated terms.
+
+The complete focused MVP regression is 14 passing tests: five scalar predicate tests, four scan-backed table-function tests, two writer-seam tests, and three tokenizer tests.
 
 ### A planner-selected posting-index cursor
 
@@ -96,6 +140,8 @@ Interpretation:
 
 POSTING already stores partition-local immutable/sealed files and selects readers through `IndexFactory`. Its public writer shape is still `add(int key, long rowId)`: it indexes SYMBOL integer keys and row IDs. BM25 additionally needs a term dictionary, term frequency, document frequency, document length, and corpus/partition aggregation. Those are data-model additions, not a small flag on the current writer.
 
+The reusable part is therefore the lifecycle shape--partition-local files, committed row-range backfill, seal/publish, and partition-aware readers--rather than the current integer-key writer API or on-disk payload.
+
 ### WAL apply and ingestion
 
 `ApplyWal2TableJob` hands data commits to `TableWriter.commitWalInsertTransactions`. `TableWriter` updates indexes in the WAL/O3 paths and commits buffered posting generations before publishing the table transaction. A synchronous tokenizer/index writer would therefore sit on the WAL apply hot path unless deliberately separated.
@@ -132,16 +178,18 @@ Partition-local text files would travel automatically during recursive detach, b
 
 ## Proposed next gate
 
-Stop here before implementing tokenization or BM25. The next approval should choose whether to run a separate native-index spike. If approved, keep that spike append-only and bounded to:
+The next bounded milestone is one experimental partition-local file writer behind `TextIndexWriter`, still with no BM25 and no SQL reader. It should:
 
-1. one ASCII/lowercase tokenizer with a fixed documented contract;
-2. one partition-local term dictionary;
-3. postings carrying row ID and term frequency;
-4. per-row document length plus per-term document frequency;
-5. an explicit offline `build text index` step, not WAL maintenance;
-6. a top-k table function or cursor that accepts a timestamp-bounded source and returns row ID plus score;
-7. scan-based BM25 as the correctness oracle;
-8. measurements for build time, warm/cold latency, storage, and load-plus-build overhead.
+1. consume the fixed ASCII tokenizer;
+2. build a term dictionary for one native partition;
+3. store postings carrying partition row ID and term frequency;
+4. store per-row document length and per-term document frequency, but calculate no score;
+5. run only through an explicit offline build harness, not `TableWriter` or WAL;
+6. publish files only on `commit`, with a format version and column-name transaction in the header;
+7. have a small reader used only by tests to verify exact terms, postings, and statistics;
+8. add a JMH build-throughput benchmark before connecting the query engine.
+
+Only after the format and build cost are measured should the existing `text_search(...)` cursor gain an index-backed path and a scan-based scoring oracle.
 
 Still excluded: O3, dedup, automatic WAL maintenance, live refresh, Parquet indexing, snapshot integration, attach validation, stemming, language analyzers, phrase search, highlighting, vector search, and RRF.
 

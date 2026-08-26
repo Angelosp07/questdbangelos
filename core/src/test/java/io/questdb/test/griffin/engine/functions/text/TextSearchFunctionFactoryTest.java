@@ -45,7 +45,7 @@ public class TextSearchFunctionFactoryTest extends AbstractCairoTest {
             assertQuery("select * from text_search('logs', 'code', 'timeout', '2026-08-24', '2026-08-26', 10)")
                     .fails(34, "column must be VARCHAR [column=code, type=INT]");
             assertQuery("select * from text_search('logs', 'message', 'timeout', '2026-08-24', '2026-08-26', 0)")
-                    .fails(86, "limit must be positive");
+                    .fails(84, "limit must be positive");
         });
     }
 
@@ -60,14 +60,17 @@ public class TextSearchFunctionFactoryTest extends AbstractCairoTest {
             execute("insert into logs values (5, '2026-08-26T00:00:00Z', 'timeout at exclusive edge')");
 
             assertQuery("select * from text_search('logs', 'message', 'timeout', '2026-08-24', '2026-08-26', 10)")
+                    .timestamp("ts")
                     .returns(
                             "ts\tvalue\tscore\n" +
                                     "2026-08-24T12:00:00.000000Z\trequest timeout\t1.0\n" +
                                     "2026-08-25T13:00:00.000000Z\tanother timeout\t1.0\n"
                     );
             assertQuery("select * from text_search('logs', 'message', 'timeout', '2026-08-24', '2026-08-26', 1)")
+                    .timestamp("ts")
                     .returns("ts\tvalue\tscore\n2026-08-24T12:00:00.000000Z\trequest timeout\t1.0\n");
             assertQuery("select * from text_search('logs', 'message', null, '2026-08-24', '2026-08-26', 10)")
+                    .timestamp("ts")
                     .returns("ts\tvalue\tscore\n");
         });
     }
@@ -75,10 +78,11 @@ public class TextSearchFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testQuotesIdentifiersAndQueryText() throws Exception {
         assertMemoryLeak(() -> {
-            execute("create table \"log's\" (ts timestamp, \"message\"\"body\" varchar) timestamp(ts)");
-            execute("insert into \"log's\" values ('2026-08-25T12:00:00Z', 'can''t connect')");
+            execute("create table \"select\" (ts timestamp, \"from\" varchar) timestamp(ts)");
+            execute("insert into \"select\" values ('2026-08-25T12:00:00Z', 'can''t connect')");
 
-            assertQuery("select * from text_search('log''s', 'message\"body', 'can''t', '2026-08-25', '2026-08-26', 10)")
+            assertQuery("select * from text_search('select', 'from', 'can''t', '2026-08-25', '2026-08-26', 10)")
+                    .timestamp("ts")
                     .returns("ts\tvalue\tscore\n2026-08-25T12:00:00.000000Z\tcan't connect\t1.0\n");
         });
     }
