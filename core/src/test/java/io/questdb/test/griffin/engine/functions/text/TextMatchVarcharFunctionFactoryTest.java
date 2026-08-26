@@ -24,7 +24,10 @@
 
 package io.questdb.test.griffin.engine.functions.text;
 
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.tools.TestUtils;
 import org.junit.Test;
 
 public class TextMatchVarcharFunctionFactoryTest extends AbstractCairoTest {
@@ -33,14 +36,16 @@ public class TextMatchVarcharFunctionFactoryTest extends AbstractCairoTest {
     public void testConstantQueryScansVarcharRows() throws Exception {
         assertMemoryLeak(() -> {
             execute("create table docs (body varchar)");
-            execute("insert into docs values ('disk failure'), ('Disk failure'), ('network outage'), (null)");
+            execute("insert into docs values ('disk failure'), ('Disk failure'), ('network outage'), ('100% ready'), (null)");
 
             assertQuery("select body from docs where text_match(body, 'failure')")
                     .returns("body\ndisk failure\nDisk failure\n");
             assertQuery("select body from docs where text_match(body, 'Failure')")
                     .returns("body\n");
             assertQuery("select body from docs where text_match(body, '')")
-                    .returns("body\ndisk failure\nDisk failure\nnetwork outage\n");
+                    .returns("body\ndisk failure\nDisk failure\nnetwork outage\n100% ready\n");
+            assertQuery("select body from docs where text_match(body, '%')")
+                    .returns("body\n100% ready\n");
         });
     }
 
@@ -62,6 +67,49 @@ public class TextMatchVarcharFunctionFactoryTest extends AbstractCairoTest {
             execute("create table docs (body varchar, query string)");
             assertQuery("select * from docs where text_match(body, query)")
                     .fails(42, "query must be a constant or bind variable");
+        });
+    }
+
+    @Test
+    public void testRuntimeConstantIsRefreshedWhenCursorReopens() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table docs (body varchar)");
+            execute("insert into docs values ('disk failure'), ('network outage'), (null)");
+            bindVariableService.setStr("query", "failure");
+
+            try (RecordCursorFactory factory = select("select body from docs where text_match(body, :query)")) {
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    sink.clear();
+                    println(factory, cursor);
+                    TestUtils.assertEquals("body\ndisk failure\n", sink);
+                }
+
+                bindVariableService.setStr("query", "outage");
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    sink.clear();
+                    println(factory, cursor);
+                    TestUtils.assertEquals("body\nnetwork outage\n", sink);
+                }
+
+                bindVariableService.setStr("query", null);
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    sink.clear();
+                    println(factory, cursor);
+                    TestUtils.assertEquals("body\n", sink);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTimestampPredicateUsesIntervalScan() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table docs (id long, ts timestamp, body varchar) timestamp(ts) partition by day");
+            execute("insert into docs values (1, '2026-08-24T12:00:00Z', 'disk failure')");
+            execute("insert into docs values (2, '2026-08-25T12:00:00Z', 'disk failure')");
+
+            assertQuery("select id from docs where ts in '2026-08-25' and text_match(body, 'failure')")
+                    .assertsPlanContaining("text_match(body", "Interval forward scan on: docs");
         });
     }
 }

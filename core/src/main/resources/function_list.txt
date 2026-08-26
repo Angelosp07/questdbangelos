@@ -204,7 +204,6 @@ io.questdb.griffin.engine.functions.regex.LikeSymbolFunctionFactory
 io.questdb.griffin.engine.functions.regex.ILikeStrFunctionFactory
 io.questdb.griffin.engine.functions.regex.ILikeVarcharFunctionFactory
 io.questdb.griffin.engine.functions.regex.ILikeSymbolFunctionFactory
-io.questdb.griffin.engine.functions.text.TextMatchVarcharFunctionFactory
 
 # 'to_char'
 io.questdb.griffin.engine.functions.date.ToStrDateFunctionFactory

@@ -43,7 +43,7 @@ import io.questdb.std.str.Utf8s;
 
 /**
  * Minimal text-search placeholder. It deliberately performs a case-sensitive literal
- * substring scan, equivalent to {@code value LIKE '%' || query || '%'}.
+ * substring scan. Unlike LIKE, '%' and '_' in the query have no special meaning.
  */
 public class TextMatchVarcharFunctionFactory implements FunctionFactory {
     public static final String NAME = "text_match";
