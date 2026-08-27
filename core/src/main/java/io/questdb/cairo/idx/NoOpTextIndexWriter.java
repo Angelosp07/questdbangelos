@@ -24,59 +24,10 @@
 
 package io.questdb.cairo.idx;
 
-import io.questdb.cairo.CairoException;
-import io.questdb.std.str.Utf8Sequence;
-import org.jetbrains.annotations.Nullable;
-
 /**
- * Validation-only writer used while the text-index file format is undecided.
- * It writes no files and retains no VARCHAR values.
+ * @deprecated The offline build path now uses {@link PartitionTextIndexWriter}. Use
+ * {@link ValidatingTextIndexWriter} explicitly when a validation-only test double is required.
  */
-public class NoOpTextIndexWriter implements TextIndexWriter {
-    private long committedRowCount;
-    private long lastRowId = -1;
-    private long rowCount;
-
-    @Override
-    public void add(long rowId, @Nullable Utf8Sequence value) {
-        if (rowId <= lastRowId) {
-            throw CairoException.nonCritical()
-                    .put("text index row IDs must be strictly increasing [lastRowId=")
-                    .put(lastRowId)
-                    .put(", rowId=")
-                    .put(rowId)
-                    .put(']');
-        }
-        lastRowId = rowId;
-        rowCount++;
-    }
-
-    @Override
-    public void clear() {
-        committedRowCount = 0;
-        lastRowId = -1;
-        rowCount = 0;
-    }
-
-    @Override
-    public void close() {
-        clear();
-    }
-
-    @Override
-    public void commit() {
-        committedRowCount = rowCount;
-    }
-
-    public long getCommittedRowCount() {
-        return committedRowCount;
-    }
-
-    public long getLastRowId() {
-        return lastRowId;
-    }
-
-    public long getRowCount() {
-        return rowCount;
-    }
+@Deprecated
+public class NoOpTextIndexWriter extends ValidatingTextIndexWriter {
 }

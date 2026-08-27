@@ -28,6 +28,8 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.DefaultCairoConfiguration;
 import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.idx.OfflineTextIndexBuilder;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlCompiler;
@@ -107,7 +109,7 @@ public class TextSearchScanBenchmark {
     @Param({"common", "rare"})
     public String frequency;
 
-    @Param({"text_match", "like", "regex"})
+    @Param({"text_match", "like", "regex", "text_search"})
     public String operator;
 
     @Param({"wide", "one_day"})
@@ -189,17 +191,30 @@ public class TextSearchScanBenchmark {
 
             verifyEquivalentResults(buildEngine, buildContext);
 
+            final OfflineTextIndexBuilder.BuildStats indexStats;
+            try (TableReader reader = buildEngine.getReader(TABLE_NAME)) {
+                indexStats = new OfflineTextIndexBuilder().build(
+                        reader,
+                        reader.getMetadata().getColumnIndexQuiet("message")
+                );
+            }
+            verifyIndexedResults(buildEngine, buildContext);
+
             final TableToken tableToken = buildEngine.getTableTokenIfExists(TABLE_NAME);
             final java.nio.file.Path tableRoot = Paths.get(CONFIGURATION.getDbRoot(), tableToken.getDirName());
             final long tableBytes = directoryBytes(tableRoot);
             final long messageBytes = messageColumnBytes(tableRoot);
             final double insertSeconds = insertNanos / 1_000_000_000.0;
             System.out.printf(
-                    "text-search corpus: %,d rows, append=%.1f rows/s, table=%.2f MiB, message=%.2f MiB%n",
+                    "text-search corpus: %,d rows, append=%.1f rows/s, table=%.2f MiB, message=%.2f MiB, " +
+                            "index=%.2f MiB (%.1f%% of message), build=%.3f s%n",
                     ROWS,
                     ROWS / insertSeconds,
                     tableBytes / 1_048_576.0,
-                    messageBytes / 1_048_576.0
+                    messageBytes / 1_048_576.0,
+                    indexStats.getIndexBytes() / 1_048_576.0,
+                    100.0 * indexStats.getIndexBytes() / messageBytes,
+                    indexStats.getBuildNanos() / 1_000_000_000.0
             );
         }
     }
@@ -309,6 +324,17 @@ public class TextSearchScanBenchmark {
             case "regex":
                 predicate = "message ~ '" + term + "'";
                 break;
+            case "text_search":
+                switch (window) {
+                    case "wide":
+                        return "SELECT count() FROM text_search('" + TABLE_NAME +
+                                "', 'message', '" + term + "', '2024-01-01', '2024-02-01', " + ROWS + ")";
+                    case "one_day":
+                        return "SELECT count() FROM text_search('" + TABLE_NAME +
+                                "', 'message', '" + term + "', '2024-01-16', '2024-01-17', " + ROWS + ")";
+                    default:
+                        throw new IllegalArgumentException("unknown window: " + window);
+                }
             default:
                 throw new IllegalArgumentException("unknown operator: " + operator);
         }
@@ -345,6 +371,29 @@ public class TextSearchScanBenchmark {
                                         ", text_match=" + textMatchCount +
                                         ", like=" + likeCount +
                                         ", regex=" + regexCount + ']'
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    private static void verifyIndexedResults(CairoEngine cairoEngine, SqlExecutionContext sqlContext) throws SqlException {
+        try (SqlCompiler sqlCompiler = cairoEngine.getSqlCompiler()) {
+            final String[] frequencies = {"common", "rare"};
+            final String[] windows = {"wide", "one_day"};
+            for (int frequencyIndex = 0; frequencyIndex < frequencies.length; frequencyIndex++) {
+                for (int windowIndex = 0; windowIndex < windows.length; windowIndex++) {
+                    final String frequency = frequencies[frequencyIndex];
+                    final String window = windows[windowIndex];
+                    final long scanCount = queryCount(sqlCompiler, sqlContext, query("text_match", frequency, window));
+                    final long indexCount = queryCount(sqlCompiler, sqlContext, query("text_search", frequency, window));
+                    if (scanCount != indexCount) {
+                        throw new IllegalStateException(
+                                "indexed results disagree with scan [frequency=" + frequency +
+                                        ", window=" + window +
+                                        ", scan=" + scanCount +
+                                        ", index=" + indexCount + ']'
                         );
                     }
                 }

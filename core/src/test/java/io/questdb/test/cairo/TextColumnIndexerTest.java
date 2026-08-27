@@ -28,8 +28,8 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.TextColumnIndexer;
 import io.questdb.cairo.VarcharTypeDriver;
-import io.questdb.cairo.idx.NoOpTextIndexWriter;
 import io.questdb.cairo.idx.TextIndexWriter;
+import io.questdb.cairo.idx.ValidatingTextIndexWriter;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryCMARW;
 import io.questdb.std.LongList;
@@ -50,7 +50,7 @@ public class TextColumnIndexerTest extends AbstractTest {
 
     @Test
     public void testNoOpWriterValidatesAppendOnlyContract() {
-        try (NoOpTextIndexWriter writer = new NoOpTextIndexWriter()) {
+        try (ValidatingTextIndexWriter writer = new ValidatingTextIndexWriter()) {
             writer.add(2, new Utf8String("first"));
             writer.add(5, null);
             Assert.assertEquals(2, writer.getRowCount());

@@ -1,6 +1,8 @@
-# Text-search PoC: pre-BM25 decision record
+# Text-search PoC: Track A decision record
 
-Status: scan skeleton, no-op append-only writer seam, and fixed tokenizer contract implemented. Persistent postings, scoring, and RRF are not implemented.
+Status: scan fallback, fixed tokenizer contract, offline native-partition index build, persistent reader/writer, partition-local BM25, and time-pruned indexed `text_search(...)` top-k are implemented. Production lifecycle integration, mixed indexed/unindexed execution, and RRF are not implemented.
+
+The concise final RFC is [`text-search-track-a-rfc.md`](text-search-track-a-rfc.md); this document retains the supporting investigation and detailed evidence.
 
 ## Recommendation
 
@@ -24,7 +26,7 @@ SELECT *
 FROM text_search('logs', 'message', 'timeout', '2026-08-24', '2026-08-26', 10);
 ```
 
-It returns `ts`, `value`, and a placeholder `score = 1.0`, applies the half-open timestamp range `[from, to)`, and limits rows in natural timestamp order. Its plan is labelled `text_search scan fallback`; it does not rank or read an index.
+It returns `ts`, `value`, and `score`, applies the half-open timestamp range `[from, to)`, and limits rows. When every selected native partition has a valid sidecar it reads postings, calculates BM25, merges partition candidates, and returns global top-k. A missing, stale, corrupt, or unsupported selected-partition index falls back to the original scan with placeholder `score = 1.0`.
 
 ## Smallest end-to-end path
 
@@ -44,7 +46,7 @@ Current files:
 - `core/src/test/java/io/questdb/test/griffin/engine/functions/text/TextSearchFunctionFactoryTest.java`: rows, range boundaries, limit, validation, quoting, cursor reopen, and fallback plan coverage.
 - `benchmarks/src/main/java/org/questdb/TextSearchScanBenchmark.java`: deterministic corpus, semantic equivalence checks, append/storage measurements, and the JMH scan matrix.
 
-There is intentionally no parser, `SqlCodeGenerator`, table metadata, `TableWriter`, or persistent index change in this version. The table function wraps the ordinary compiled scan cursor rather than adding an index-selected planner path.
+There is intentionally no parser, `SqlCodeGenerator`, table metadata, or `TableWriter` change. The table function owns the experimental index-selection boundary and retains the ordinary compiled scan cursor as its fallback.
 
 ## Existing patterns worth copying
 
@@ -66,14 +68,16 @@ Relevant files:
 
 ## Append-only write seam and tokenizer
 
-The first write path is deliberately offline and has no index output yet:
+The column feeder remains deliberately offline:
 
 1. `TextColumnIndexer` reads a committed `[loRow, hiRow)` range from native VARCHAR aux/data memory using `VarcharTypeDriver`.
 2. It converts physical offsets using `columnTop`, while preserving partition-local row IDs.
 3. It calls `TextIndexWriter.add(rowId, value)` once per stored row, including null values.
-4. `NoOpTextIndexWriter` retains no values and writes no files; it only validates strictly increasing row IDs and exposes a commit watermark for tests.
+4. `ValidatingTextIndexWriter` is the explicitly named boundary test double; the old `NoOpTextIndexWriter` name is deprecated.
+5. `PartitionTextIndexWriter` implements the real boundary for one partition and column instance, publishing a versioned sidecar only after a successful commit.
+6. `OfflineTextIndexBuilder` walks committed native partitions and feeds their VARCHAR mappings into the persistent writer.
 
-This is the minimal replacement point for the later partition-local file writer. It is intentionally not registered in `TableWriter`: an explicit offline build can open each committed native partition and use this range feeder without implying WAL, O3, deduplication, or metadata support.
+The persistent writer is intentionally not registered in `TableWriter`: an explicit offline build can open each committed native partition and use this range feeder without implying WAL, O3, deduplication, or metadata support.
 
 The tokenizer contract is also fixed:
 
@@ -90,12 +94,17 @@ Evidence files:
 - `core/src/main/java/io/questdb/cairo/idx/TextIndexWriter.java`
 - `core/src/main/java/io/questdb/cairo/idx/NoOpTextIndexWriter.java`
 - `core/src/main/java/io/questdb/cairo/idx/AsciiTextTokenizer.java`
+- `core/src/main/java/io/questdb/cairo/idx/PartitionTextIndexWriter.java`
+- `core/src/main/java/io/questdb/cairo/idx/PartitionTextIndexReader.java`
+- `core/src/main/java/io/questdb/cairo/idx/PartitionTextIndexSearcher.java`
+- `core/src/main/java/io/questdb/cairo/idx/OfflineTextIndexBuilder.java`
+- `core/src/test/java/io/questdb/test/cairo/PartitionTextIndexTest.java`
 - `core/src/test/java/io/questdb/test/cairo/TextColumnIndexerTest.java`
 - `core/src/test/java/io/questdb/test/cairo/AsciiTextTokenizerTest.java`
 
 The five focused writer/tokenizer tests pass. They cover inline and split VARCHAR storage, nulls, `columnTop` row-ID mapping, append-order rejection, null/empty input, normalization, delimiter behavior, and repeated terms.
 
-The complete focused MVP regression is 14 passing tests: five scalar predicate tests, four scan-backed table-function tests, two writer-seam tests, and three tokenizer tests.
+The complete focused regression is 20 tests: five scalar predicate tests, four scan-backed table-function tests, two writer-seam tests, three tokenizer tests, and six persistent partition-index tests. The six standalone partition-index tests pass locally; the older engine-backed suites remain subject to the documented native test-bootstrap issue.
 
 ### A planner-selected posting-index cursor
 
@@ -131,6 +140,25 @@ Interpretation:
 - Match rarity barely changes scan cost, as expected without an index.
 - The skeleton is faster than regex but slower than the existing `LIKE` implementation. It is a useful API seam, not a performance feature.
 - The benchmark supports `cache=cold_linux`, which releases readers and uses `POSIX_FADV_DONTNEED`. QuestDB's `Files.fadvise` is Linux-only, so cold-cache evidence still needs a Linux run.
+
+### Indexed MVP measurements
+
+The indexed development run used the same 2,000,000-row, 16-partition corpus on JDK 25/macOS arm64, with one 1-second warm-up and three 1-second measurement iterations. `text_search` materializes all matching postings in selected partitions, calculates BM25, sorts them, and the benchmark consumes every result via `count()`; these numbers therefore include ranking and materialization rather than measuring a boolean count shortcut.
+
+- Append throughput: 3.44 million rows/s (about 0.581 s for the corpus).
+- Raw `message` VARCHAR files: 408.81 MiB.
+- Text index: 282.07 MiB, or 69.0% of the raw VARCHAR files.
+- Offline index build: 1.313 s, about 1.52 million rows/s.
+- If paid synchronously after this append, build adds about 226% to load time; the MVP intentionally keeps it offline.
+
+| Frequency | Window | Scan | Indexed BM25 | Indexed / scan |
+|---|---:|---:|---:|---:|
+| common (10%) | 16 days | 51.27 ms | 70.63 ms | 0.73× (slower) |
+| common (10%) | 1 day | 3.27 ms | 4.13 ms | 0.79× (slower) |
+| rare (0.01%) | 16 days | 53.39 ms | 30.97 ms | 1.72× faster |
+| rare (0.01%) | 1 day | 3.46 ms | 1.44 ms | 2.40× faster |
+
+This proves the index can beat brute-force scanning for selective terms and that timestamp partition pruning is effective. It also exposes the next optimization gate: common terms need a bounded heap/WAND-style top-k path rather than materializing and sorting every posting.
 
 ## What the existing index lifecycle tells us
 
@@ -176,20 +204,22 @@ Partition-local text files would travel automatically during recursive detach, b
 | Embedded Lucene/Tantivy | Medium for isolated demo, low for integration | Mature search semantics | Separate transaction/lifecycle model, heap/FFI, duplicate partition management | Do not choose before measuring native design cost |
 | Query-time BM25 | Medium | No persistent index | At least one expensive token/statistics pass; poor top-k scaling | Useful only as a correctness oracle |
 
-## Proposed next gate
+## Completed partition-file gate
 
-The next bounded milestone is one experimental partition-local file writer behind `TextIndexWriter`, still with no BM25 and no SQL reader. It should:
+The experimental partition-local writer behind `TextIndexWriter` now:
 
 1. consume the fixed ASCII tokenizer;
 2. build a term dictionary for one native partition;
 3. store postings carrying partition row ID and term frequency;
-4. store per-row document length and per-term document frequency, but calculate no score;
-5. run only through an explicit offline build harness, not `TableWriter` or WAL;
+4. store per-row document length and per-term document frequency;
+5. is built by `OfflineTextIndexBuilder` through the offline `TextColumnIndexer` seam, not `TableWriter` or WAL;
 6. publish files only on `commit`, with a format version and column-name transaction in the header;
-7. have a small reader used only by tests to verify exact terms, postings, and statistics;
-8. add a JMH build-throughput benchmark before connecting the query engine.
+7. has a small reader used by tests to verify exact terms, postings, statistics, format identity, and corruption rejection;
+8. uses those postings in a partition-local OR-query scorer with BM25 (`k1=1.2`, `b=0.75`), deterministic score/row-ID ordering, query-term deduplication, and top-k truncation;
+9. connects the scorer to `text_search(...)`, prunes partitions by `[from,to)`, filters exact timestamp boundaries, merges scores globally, and returns the source timestamp and VARCHAR value;
+10. falls back to the existing scan cursor when a selected partition is missing a valid native sidecar.
 
-Only after the format and build cost are measured should the existing `text_search(...)` cursor gain an index-backed path and a scan-based scoring oracle.
+The six focused partition-index tests pass, including an end-to-end VARCHAR-memory-to-persistent-postings build and BM25 scores checked against an independent numeric oracle. Main sources, test sources, and the benchmark jar compile. The indexed SQL path executes in JMH; its dedicated engine test is compiled but cannot run locally because the existing test harness fails first during unrelated native bootstrap.
 
 Still excluded: O3, dedup, automatic WAL maintenance, live refresh, Parquet indexing, snapshot integration, attach validation, stemming, language analyzers, phrase search, highlighting, vector search, and RRF.
 
